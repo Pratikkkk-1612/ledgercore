@@ -1,0 +1,21 @@
+# CMake build output
+build/
+cmake-build-*/
+
+# VS Code local settings
+.vscode/
+
+# Environment / secrets
+.env
+
+# Logs
+*.log
+
+# Compiled files
+*.exe
+*.obj
+*.pdb
+*.dll
+
+# Test / coverage output
+coverage/
