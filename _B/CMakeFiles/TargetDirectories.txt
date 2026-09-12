@@ -1,3 +1,0 @@
-D:/Projects/ledgercore/_B/CMakeFiles/ledgercore.dir
-D:/Projects/ledgercore/_B/CMakeFiles/ALL_BUILD.dir
-D:/Projects/ledgercore/_B/CMakeFiles/ZERO_CHECK.dir
