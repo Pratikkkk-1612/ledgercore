@@ -18,4 +18,5 @@ cmake-build-*/
 *.dll
 
 # Test / coverage output
-coverage/
+coverage/passwords.txt
+passwords.txt
