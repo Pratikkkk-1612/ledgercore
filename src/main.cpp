@@ -1,16 +1,25 @@
+
 #include <iostream>
 #include <string>
 #include <cstdlib>
 #include <libpq-fe.h>
 
 // ------------------------------------------------------------
-// Execute a SQL command that does not return rows
+// Execute a SQL command without parameters
 // ------------------------------------------------------------
 
 bool executeQuery(PGconn* conn, const char* query)
 {
     PGresult* result = PQexec(conn, query);
- 
+
+    if (result == nullptr)
+    {
+        std::cerr << "Query execution failed:\n"
+                  << PQerrorMessage(conn)
+                  << std::endl;
+        return false;
+    }
+
     if (PQresultStatus(result) != PGRES_COMMAND_OK)
     {
         std::cerr << "Query failed:\n"
@@ -27,6 +36,7 @@ bool executeQuery(PGconn* conn, const char* query)
 
 // ------------------------------------------------------------
 // Execute a parameterized SQL command
+// Optionally returns affected rows and SQLSTATE.
 // ------------------------------------------------------------
 
 bool executeParameterizedCommand(
@@ -34,8 +44,14 @@ bool executeParameterizedCommand(
     const char* query,
     int parameterCount,
     const char* const* parameterValues,
-    int* rowsAffected = nullptr)
+    int* rowsAffected = nullptr,
+    std::string* sqlState = nullptr)
 {
+    if (sqlState != nullptr)
+    {
+        sqlState->clear();
+    }
+
     PGresult* result = PQexecParams(
         conn,
         query,
@@ -47,8 +63,27 @@ bool executeParameterizedCommand(
         0
     );
 
+    if (result == nullptr)
+    {
+        std::cerr << "Parameterized query execution failed:\n"
+                  << PQerrorMessage(conn)
+                  << std::endl;
+        return false;
+    }
+
     if (PQresultStatus(result) != PGRES_COMMAND_OK)
     {
+        if (sqlState != nullptr)
+        {
+            const char* state =
+                PQresultErrorField(result, PG_DIAG_SQLSTATE);
+
+            if (state != nullptr)
+            {
+                *sqlState = state;
+            }
+        }
+
         std::cerr << "Parameterized query failed:\n"
                   << PQerrorMessage(conn)
                   << std::endl;
@@ -68,6 +103,7 @@ bool executeParameterizedCommand(
 
 // ------------------------------------------------------------
 // Execute a parameterized query that returns rows
+// Used for INSERT ... RETURNING.
 // ------------------------------------------------------------
 
 PGresult* executeParameterizedQuery(
@@ -87,6 +123,14 @@ PGresult* executeParameterizedQuery(
         0
     );
 
+    if (result == nullptr)
+    {
+        std::cerr << "Parameterized query execution failed:\n"
+                  << PQerrorMessage(conn)
+                  << std::endl;
+        return nullptr;
+    }
+
     if (PQresultStatus(result) != PGRES_TUPLES_OK)
     {
         std::cerr << "Parameterized query failed:\n"
@@ -101,11 +145,10 @@ PGresult* executeParameterizedQuery(
 }
 
 // ------------------------------------------------------------
-// Convert paise to an exact decimal SQL value.
+// Convert paise into an exact decimal SQL value.
 //
-// Example:
-// 10000 paise -> "100.00"
-// 150 paise  -> "1.50"
+// 10000 paise = 100.00
+// 150 paise   = 1.50
 // ------------------------------------------------------------
 
 std::string formatAmount(long long amountPaise)
@@ -130,21 +173,30 @@ std::string formatAmount(long long amountPaise)
 // Perform an atomic money transfer
 //
 // amountPaise:
-//     Money is represented as an integer number of paise.
-//     Example: ₹100.00 = 10000 paise.
+//     Money represented as integer paise.
 //
 // injectFailure:
-//     Test-only switch used to verify rollback.
+//     Enables controlled rollback testing.
+//
+// expectedFailureObserved:
+//     True only when the expected FK error occurs
+//     and ROLLBACK succeeds.
 // ------------------------------------------------------------
 
 bool transfer(
     PGconn* conn,
-    int sourceAccountId,
-    int destinationAccountId,
+    long long sourceAccountId,
+    long long destinationAccountId,
     long long amountPaise,
     const std::string& reference,
-    bool injectFailure = false)
+    bool injectFailure = false,
+    bool* expectedFailureObserved = nullptr)
 {
+    if (expectedFailureObserved != nullptr)
+    {
+        *expectedFailureObserved = false;
+    }
+
     // --------------------------------------------------------
     // Basic validation
     // --------------------------------------------------------
@@ -166,10 +218,10 @@ bool transfer(
         return false;
     }
 
-    std::string amount =
+    const std::string amount =
         formatAmount(amountPaise);
 
-    std::string negativeAmount =
+    const std::string negativeAmount =
         "-" + amount;
 
     std::cout << "\nStarting transfer: "
@@ -194,7 +246,7 @@ bool transfer(
     // 2. Debit source account
     // --------------------------------------------------------
 
-    std::string sourceAccount =
+    const std::string sourceAccount =
         std::to_string(sourceAccountId);
 
     const char* debitParameters[] =
@@ -236,7 +288,7 @@ bool transfer(
     // 3. Credit destination account
     // --------------------------------------------------------
 
-    std::string destinationAccount =
+    const std::string destinationAccount =
         std::to_string(destinationAccountId);
 
     const char* creditParameters[] =
@@ -275,9 +327,6 @@ bool transfer(
 
     // --------------------------------------------------------
     // 4. Create transaction record
-    //
-    // RETURNING id gives us the exact transaction ID without
-    // querying the transaction table again by reference.
     // --------------------------------------------------------
 
     const char* transactionParameters[] =
@@ -307,8 +356,7 @@ bool transfer(
 
     if (PQntuples(transactionResult) != 1)
     {
-        std::cerr << "Transaction creation returned "
-                  << "an unexpected result."
+        std::cerr << "Unexpected transaction result."
                   << std::endl;
 
         PQclear(transactionResult);
@@ -316,7 +364,7 @@ bool transfer(
         return false;
     }
 
-    std::string transactionId =
+    const std::string transactionId =
         PQgetvalue(transactionResult, 0, 0);
 
     PQclear(transactionResult);
@@ -364,7 +412,7 @@ bool transfer(
         std::cerr << "Journal entry creation failed: expected "
                   << "2 rows, but created "
                   << rowsAffected
-                  << " rows."
+                  << "."
                   << std::endl;
 
         executeQuery(conn, "ROLLBACK;");
@@ -376,9 +424,6 @@ bool transfer(
 
     // --------------------------------------------------------
     // 6. Controlled failure injection
-    //
-    // This is used only during Phase 3 rollback validation.
-    // The invalid user ID intentionally violates the FK.
     // --------------------------------------------------------
 
     if (injectFailure)
@@ -393,27 +438,46 @@ bool transfer(
             "0.00"
         };
 
+        std::string actualSqlState;
+
         bool failureQuerySucceeded =
             executeParameterizedCommand(
                 conn,
                 "INSERT INTO accounts(user_id, currency, balance) "
                 "VALUES ($1, $2, $3);",
                 3,
-                failureParameters
+                failureParameters,
+                nullptr,
+                &actualSqlState
             );
+
+        // Failure must actually occur.
 
         if (failureQuerySucceeded)
         {
-            std::cerr << "ERROR: deliberate failure "
-                      << "did not occur."
+            std::cerr << "ERROR: Deliberate failure did not occur."
                       << std::endl;
 
             executeQuery(conn, "ROLLBACK;");
             return false;
         }
 
-        std::cout << "Expected failure occurred."
+        // Only SQLSTATE 23503 is expected.
+
+        if (actualSqlState != "23503")
+        {
+            std::cerr << "Unexpected database error. SQLSTATE: "
+                      << actualSqlState
+                      << std::endl;
+
+            executeQuery(conn, "ROLLBACK;");
+            return false;
+        }
+
+        std::cout << "Expected foreign-key violation confirmed."
                   << std::endl;
+
+        // Rollback must succeed.
 
         std::cout << "Rolling back transaction..."
                   << std::endl;
@@ -428,6 +492,14 @@ bool transfer(
 
         std::cout << "Transaction rolled back successfully."
                   << std::endl;
+
+        // Mark test as passed only after expected error
+        // and successful rollback.
+
+        if (expectedFailureObserved != nullptr)
+        {
+            *expectedFailureObserved = true;
+        }
 
         return false;
     }
@@ -461,23 +533,26 @@ int main()
               << std::endl;
 
     // --------------------------------------------------------
-    // Connect to PostgreSQL
+    // 1. Connect to validation database
     // --------------------------------------------------------
 
     PGconn* conn = PQconnectdb(
         "host=127.0.0.1 "
         "port=5432 "
-        "dbname=ledgercore "
+        "dbname=ledgercore_validation_20261106 "
         "user=ledgercore"
     );
 
-    if (PQstatus(conn) != CONNECTION_OK)
+    if (conn == nullptr || PQstatus(conn) != CONNECTION_OK)
     {
-        std::cerr << "Database connection failed:\n"
-                  << PQerrorMessage(conn)
-                  << std::endl;
+        std::cerr << "Database connection failed:\n";
 
-        PQfinish(conn);
+        if (conn != nullptr)
+        {
+            std::cerr << PQerrorMessage(conn);
+            PQfinish(conn);
+        }
+
         return 1;
     }
 
@@ -485,59 +560,71 @@ int main()
               << std::endl;
 
     // --------------------------------------------------------
-    // Check whether rollback test mode is enabled
+    // 2. Determine test mode
     // --------------------------------------------------------
 
     const char* rollbackTest =
         std::getenv("LEDGERCORE_TEST_ROLLBACK");
 
-    bool runRollbackTest =
+    const bool runRollbackTest =
         rollbackTest != nullptr &&
         std::string(rollbackTest) == "1";
 
-    // --------------------------------------------------------
-    // Execute transfer
-    // --------------------------------------------------------
+    bool success = false;
+    bool expectedFailureObserved = false;
 
-    bool success;
+    // --------------------------------------------------------
+    // 3. Execute transfer
+    // --------------------------------------------------------
 
     if (runRollbackTest)
     {
+        std::cout << "\nRunning rollback validation..."
+                  << std::endl;
+
         success = transfer(
             conn,
-            1,
-            2,
-            10000,  // ₹100.00
-            "PHASE3-FINAL-ROLLBACK-001",
-            true
+            19,
+            20,
+            10000,
+            "P4-ROLLBACK-002",
+            true,
+            &expectedFailureObserved
         );
     }
     else
     {
+        std::cout << "\nRunning normal transfer..."
+                  << std::endl;
+
         success = transfer(
             conn,
-            1,
-            2,
-            10000,  // ₹100.00
-            "PHASE3-FINAL-001"
+            19,
+            20,
+            10000,
+            "P4-SUCCESS-002",
+            false
         );
     }
 
     // --------------------------------------------------------
-    // Print result
+    // 4. Evaluate result
     // --------------------------------------------------------
+
+    bool testPassed = false;
 
     if (runRollbackTest)
     {
-        if (!success)
+        if (!success && expectedFailureObserved)
         {
-            std::cout << "\nPhase 3 rollback test completed."
+            std::cout << "\nROLLBACK TEST PASSED."
                       << std::endl;
+
+            testPassed = true;
         }
         else
         {
-            std::cerr << "\nERROR: rollback test unexpectedly "
-                      << "succeeded."
+            std::cerr << "\nROLLBACK TEST FAILED."
                       << std::endl;
         }
     }
@@ -550,21 +637,20 @@ int main()
         }
         else
         {
-            std::cout << "\nTransfer failed."
+            std::cerr << "\nTransfer failed."
                       << std::endl;
         }
     }
 
     // --------------------------------------------------------
-    // Close connection
+    // 5. Close connection
     // --------------------------------------------------------
 
     PQfinish(conn);
 
-    // An expected rollback-test failure is a successful test.
-    if (runRollbackTest && !success)
+    if (runRollbackTest)
     {
-        return 0;
+        return testPassed ? 0 : 1;
     }
 
     return success ? 0 : 1;
