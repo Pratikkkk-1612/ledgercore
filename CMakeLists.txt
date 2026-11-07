@@ -23,3 +23,17 @@ target_link_libraries(ledgercore
     PRIVATE
     PostgreSQL::PostgreSQL
 )
+
+# Explicit experiment target: uses the same transfer implementation, with
+# test-only synchronization after the debit. No locking/retry fix is applied.
+find_package(Threads REQUIRED)
+add_executable(ledgercore_concurrency EXCLUDE_FROM_ALL
+    tests/validate_phase5.cpp
+    src/main.cpp
+)
+target_compile_definitions(ledgercore_concurrency PRIVATE
+    LEDGERCORE_NO_MAIN LEDGERCORE_CONCURRENCY_TEST
+)
+target_link_libraries(ledgercore_concurrency PRIVATE
+    PostgreSQL::PostgreSQL Threads::Threads
+)
