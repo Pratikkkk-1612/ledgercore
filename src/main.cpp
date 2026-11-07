@@ -1,6 +1,8 @@
 
 #include <iostream>
+#include <charconv>
 #include <string>
+#include <string_view>
 #include <cstdlib>
 #include <libpq-fe.h>
 #include "transfer.hpp"
@@ -550,13 +552,78 @@ bool transfer(
 // ------------------------------------------------------------
 
 #ifndef LEDGERCORE_NO_MAIN
-int main()
+static bool parsePositiveInteger(std::string_view text, long long& value)
+{
+    if (text.empty())
+    {
+        return false;
+    }
+
+    const char* end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value);
+    return result.ec == std::errc{} && result.ptr == end && value > 0;
+}
+
+int main(int argc, char* argv[])
 {
     std::cout << "LedgerCore starting..."
               << std::endl;
 
     // --------------------------------------------------------
-    // 1. Connect to validation database
+    // 1. Determine test mode
+    // --------------------------------------------------------
+
+    const char* rollbackTest =
+        std::getenv("LEDGERCORE_TEST_ROLLBACK");
+
+    const bool runRollbackTest =
+        rollbackTest != nullptr &&
+        std::string(rollbackTest) == "1";
+
+    long long sourceAccountId = 0;
+    long long destinationAccountId = 0;
+    long long amountPaise = 0;
+    std::string reference;
+
+    if (!runRollbackTest)
+    {
+        if (argc != 5)
+        {
+            std::cerr << "Usage: " << argv[0]
+                      << " <source_account_id> <destination_account_id>"
+                      << " <amount_paise> <reference>\n";
+            return 2;
+        }
+
+        if (!parsePositiveInteger(argv[1], sourceAccountId) ||
+            !parsePositiveInteger(argv[2], destinationAccountId))
+        {
+            std::cerr << "Account IDs must be positive whole numbers.\n";
+            return 2;
+        }
+        if (sourceAccountId == destinationAccountId)
+        {
+            std::cerr << "Source and destination accounts must be different.\n";
+            return 2;
+        }
+        if (!parsePositiveInteger(argv[3], amountPaise))
+        {
+            std::cerr << "Amount must be a positive whole number of paise.\n";
+            return 2;
+        }
+        reference = argv[4];
+        if (reference.find_first_not_of(" \t\r\n\f\v") == std::string::npos)
+        {
+            std::cerr << "Transfer reference must contain a non-whitespace character.\n";
+            return 2;
+        }
+    }
+
+    bool success = false;
+    bool expectedFailureObserved = false;
+
+    // --------------------------------------------------------
+    // 2. Connect to validation database
     // --------------------------------------------------------
 
     PGconn* conn = PQconnectdb(
@@ -581,20 +648,6 @@ int main()
 
     std::cout << "Connected to PostgreSQL successfully."
               << std::endl;
-
-    // --------------------------------------------------------
-    // 2. Determine test mode
-    // --------------------------------------------------------
-
-    const char* rollbackTest =
-        std::getenv("LEDGERCORE_TEST_ROLLBACK");
-
-    const bool runRollbackTest =
-        rollbackTest != nullptr &&
-        std::string(rollbackTest) == "1";
-
-    bool success = false;
-    bool expectedFailureObserved = false;
 
     // --------------------------------------------------------
     // 3. Execute transfer
@@ -622,10 +675,10 @@ int main()
 
         success = transfer(
             conn,
-            19,
-            20,
-            10000,
-            "P4-SUCCESS-002",
+            sourceAccountId,
+            destinationAccountId,
+            amountPaise,
+            reference,
             false
         );
     }
