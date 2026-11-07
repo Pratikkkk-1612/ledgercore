@@ -3,6 +3,11 @@
 #include <string>
 #include <cstdlib>
 #include <libpq-fe.h>
+#include "transfer.hpp"
+
+#ifdef LEDGERCORE_CONCURRENCY_TEST
+#include "../tests/concurrency_hooks.hpp"
+#endif
 
 // ------------------------------------------------------------
 // Execute a SQL command without parameters
@@ -22,6 +27,9 @@ bool executeQuery(PGconn* conn, const char* query)
 
     if (PQresultStatus(result) != PGRES_COMMAND_OK)
     {
+#ifdef LEDGERCORE_CONCURRENCY_TEST
+        ledgercoreTestSqlError(result);
+#endif
         std::cerr << "Query failed:\n"
                   << PQerrorMessage(conn)
                   << std::endl;
@@ -73,6 +81,9 @@ bool executeParameterizedCommand(
 
     if (PQresultStatus(result) != PGRES_COMMAND_OK)
     {
+#ifdef LEDGERCORE_CONCURRENCY_TEST
+        ledgercoreTestSqlError(result);
+#endif
         if (sqlState != nullptr)
         {
             const char* state =
@@ -133,6 +144,9 @@ PGresult* executeParameterizedQuery(
 
     if (PQresultStatus(result) != PGRES_TUPLES_OK)
     {
+#ifdef LEDGERCORE_CONCURRENCY_TEST
+        ledgercoreTestSqlError(result);
+#endif
         std::cerr << "Parameterized query failed:\n"
                   << PQerrorMessage(conn)
                   << std::endl;
@@ -189,8 +203,8 @@ bool transfer(
     long long destinationAccountId,
     long long amountPaise,
     const std::string& reference,
-    bool injectFailure = false,
-    bool* expectedFailureObserved = nullptr)
+    bool injectFailure,
+    bool* expectedFailureObserved)
 {
     if (expectedFailureObserved != nullptr)
     {
@@ -283,6 +297,14 @@ bool transfer(
 
     std::cout << "Source account debited."
               << std::endl;
+
+#ifdef LEDGERCORE_CONCURRENCY_TEST
+    if (!ledgercoreTestAfterDebit())
+    {
+        executeQuery(conn, "ROLLBACK;");
+        return false;
+    }
+#endif
 
     // --------------------------------------------------------
     // 3. Credit destination account
@@ -527,6 +549,7 @@ bool transfer(
 // Main
 // ------------------------------------------------------------
 
+#ifndef LEDGERCORE_NO_MAIN
 int main()
 {
     std::cout << "LedgerCore starting..."
@@ -655,3 +678,4 @@ int main()
 
     return success ? 0 : 1;
 }
+#endif
