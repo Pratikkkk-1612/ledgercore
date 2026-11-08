@@ -259,7 +259,81 @@ bool transfer(
     }
 
     // --------------------------------------------------------
-    // 2. Debit source account
+// 2. Acquire account locks in ascending ID order
+// --------------------------------------------------------
+
+const long long firstAccountId =
+    sourceAccountId < destinationAccountId
+        ? sourceAccountId
+        : destinationAccountId;
+
+const long long secondAccountId =
+    sourceAccountId < destinationAccountId
+        ? destinationAccountId
+        : sourceAccountId;
+
+const long long lockOrder[] =
+{
+    firstAccountId,
+    secondAccountId
+};
+
+for (const long long accountId : lockOrder)
+{
+    const std::string accountIdText =
+        std::to_string(accountId);
+
+    const char* lockParameters[] =
+    {
+        accountIdText.c_str()
+    };
+
+    PGresult* lockResult =
+        executeParameterizedQuery(
+            conn,
+            "SELECT id FROM accounts "
+            "WHERE id = $1 "
+            "FOR UPDATE;",
+            1,
+            lockParameters
+        );
+
+    if (lockResult == nullptr)
+    {
+        std::cerr << "Account locking failed."
+                  << std::endl;
+
+        executeQuery(conn, "ROLLBACK;");
+        return false;
+    }
+
+    const bool accountFound =
+        PQntuples(lockResult) == 1;
+
+    PQclear(lockResult);
+
+    if (!accountFound)
+    {
+        std::cerr << "Account locking failed: "
+                  << "account does not exist."
+                  << std::endl;
+
+        executeQuery(conn, "ROLLBACK;");
+        return false;
+    }
+}
+#ifdef LEDGERCORE_CONCURRENCY_TEST
+    if (!ledgercoreTestAfterAccountLocks())
+    {
+        executeQuery(conn, "ROLLBACK;");
+        return false;
+    }
+#endif
+
+
+
+    // --------------------------------------------------------
+    // 3. Debit source account
     // --------------------------------------------------------
 
     const std::string sourceAccount =
@@ -300,16 +374,9 @@ bool transfer(
     std::cout << "Source account debited."
               << std::endl;
 
-#ifdef LEDGERCORE_CONCURRENCY_TEST
-    if (!ledgercoreTestAfterDebit())
-    {
-        executeQuery(conn, "ROLLBACK;");
-        return false;
-    }
-#endif
 
     // --------------------------------------------------------
-    // 3. Credit destination account
+    // 4. Credit destination account
     // --------------------------------------------------------
 
     const std::string destinationAccount =
@@ -350,7 +417,7 @@ bool transfer(
               << std::endl;
 
     // --------------------------------------------------------
-    // 4. Create transaction record
+    // 5. Create transaction record
     // --------------------------------------------------------
 
     const char* transactionParameters[] =
@@ -398,7 +465,7 @@ bool transfer(
               << std::endl;
 
     // --------------------------------------------------------
-    // 5. Create journal entries
+    // 6. Create journal entries
     // --------------------------------------------------------
 
     const char* journalParameters[] =
@@ -447,7 +514,7 @@ bool transfer(
               << std::endl;
 
     // --------------------------------------------------------
-    // 6. Controlled failure injection
+    // 7. Controlled failure injection
     // --------------------------------------------------------
 
     if (injectFailure)
@@ -529,7 +596,7 @@ bool transfer(
     }
 
     // --------------------------------------------------------
-    // 7. Commit transaction
+    // 8. Commit transaction
     // --------------------------------------------------------
 
     if (!executeQuery(conn, "COMMIT;"))
