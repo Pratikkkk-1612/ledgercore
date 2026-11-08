@@ -4,5 +4,5 @@
 
 // Compiled only into the experiment executable, never the normal application.
 // Returning false aborts a test whose synchronization deadline was missed.
-bool ledgercoreTestAfterDebit();
+bool ledgercoreTestAfterAccountLocks();
 void ledgercoreTestSqlError(PGresult* result);

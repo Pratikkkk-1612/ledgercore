@@ -22,7 +22,7 @@ struct Gate {
     std::mutex mutex;
     std::condition_variable cv;
     int arrived = 0;
-    int target = 0; // zero: controller releases; two: both debits must finish
+    int target = 0; // zero: controller releases; positive: release after target arrivals
     bool released = false;
     bool timedOut = false;
 
@@ -216,7 +216,7 @@ bool competing(PGconn* observer) {
                              std::cref(f.refs[0]), &gate, std::ref(a));
         if (!gate.awaitFirst()) {
             gate.release();
-            throw std::runtime_error("First debit did not reach the test checkpoint");
+            throw std::runtime_error("First transfer did not reach the account-lock checkpoint");
         }
         std::jthread worker2(runWorker, second.get(), f.accounts[0], f.accounts[2], 8000,
                              std::cref(f.refs[1]), nullptr, std::ref(b));
@@ -246,39 +246,125 @@ bool competing(PGconn* observer) {
     return ok;
 }
 
+
 bool opposing(PGconn* observer) {
-    std::cout << "\nEXPERIMENT 2: opposite transfers, both source debits held before credit\n";
+    std::cout << "\nEXPERIMENT 2: opposite transfers with ordered account locks\n";
+
     Fixtures f(observer, "opposing", {"100.00", "100.00"});
+
     auto first = connect();
     auto second = connect();
-    std::cout << "deadlock_timeout=" << scalar(first.get(), "SHOW deadlock_timeout") << '\n';
+
+    const auto firstPid = std::to_string(PQbackendPID(first.get()));
+    const auto secondPid = std::to_string(PQbackendPID(second.get()));
+
     Gate gate;
-    gate.target = 2;
     Outcome a, b;
+    bool sawBlocking = false;
+
     {
-        std::jthread worker1(runWorker, first.get(), f.accounts[0], f.accounts[1], 1000,
-                             std::cref(f.refs[0]), &gate, std::ref(a));
-        std::jthread worker2(runWorker, second.get(), f.accounts[1], f.accounts[0], 1000,
-                             std::cref(f.refs[1]), &gate, std::ref(b));
-    }
-    show("A -> B", a); show("B -> A", b);
-    const auto balanceA = f.balance(0), balanceB = f.balance(1);
-    std::cout << "Balances in paise: " << balanceA << ", " << balanceB << '\n';
-    const bool oneVictim = (a.success && a.sqlstate.empty() && !b.success && b.sqlstate == "40P01") ||
-                          (b.success && b.sqlstate.empty() && !a.success && a.sqlstate == "40P01");
-    const bool ok = !gate.timedOut && gate.arrived == 2 && oneVictim &&
-        a.exception.empty() && b.exception.empty() && a.idle && b.idle &&
-        balanceA == (a.success ? 9000 : 11000) && balanceB == (a.success ? 11000 : 9000) &&
+        // Thread A: Account 1 -> Account 2
+        std::jthread worker1(
+            runWorker,
+            first.get(),
+            f.accounts[0],
+            f.accounts[1],
+            1000,
+            std::cref(f.refs[0]),
+            &gate,
+            std::ref(a)
+        );
+
+        // Wait until Thread A has acquired both locks.
+        if (!gate.awaitFirst()) {
+            gate.release();
+            throw std::runtime_error(
+                "First transfer did not reach the account-lock checkpoint"
+            );
+        }
+
+        // Thread B: Account 2 -> Account 1
+        std::jthread worker2(
+            runWorker,
+            second.get(),
+            f.accounts[1],
+            f.accounts[0],
+            1000,
+            std::cref(f.refs[1]),
+            nullptr,
+            std::ref(b)
+        );
+
+        try {
+            // Confirm Thread B is blocked by Thread A.
+            const auto deadline =
+                std::chrono::steady_clock::now() + 4s;
+
+            do {
+                sawBlocking = scalar(
+                    observer,
+                    "SELECT $1::int = ANY(pg_blocking_pids($2::int))",
+                    {firstPid, secondPid}
+                ) == "t";
+
+                if (sawBlocking) {
+                    break;
+                }
+
+                std::this_thread::sleep_for(50ms);
+
+            } while (std::chrono::steady_clock::now() < deadline);
+
+        } catch (...) {
+            gate.release();
+            throw;
+        }
+
+        // Allow Thread A to finish and release its locks.
+        gate.release();
+
+    } // Both worker threads are joined here.
+
+    show("A -> B", a);
+    show("B -> A", b);
+
+    const auto balanceA = f.balance(0);
+    const auto balanceB = f.balance(1);
+
+    std::cout << "Balances in paise: "
+              << balanceA << ", " << balanceB << '\n';
+
+    const bool bothCommitted =
+        a.success &&
+        b.success &&
+        a.sqlstate.empty() &&
+        b.sqlstate.empty();
+
+    const bool ok =
+        sawBlocking &&
+        !gate.timedOut &&
+        gate.arrived == 1 &&
+        bothCommitted &&
+        a.exception.empty() &&
+        b.exception.empty() &&
+        a.idle &&
+        b.idle &&
+        balanceA == 10000 &&
+        balanceB == 10000 &&
         balanceA + balanceB == 20000 &&
-        f.ledger(0, a.success, 0, 1, "10.00") && f.ledger(1, b.success, 1, 0, "10.00");
+        f.ledger(0, true, 0, 1, "10.00") &&
+        f.ledger(1, true, 1, 0, "10.00");
+
     f.cleanup();
-    std::cout << (ok ? "REPRODUCED" : "FAIL/INCONCLUSIVE")
-              << ": deadlock 40P01 with one committed transfer and full victim rollback\n";
+
+    std::cout << (ok ? "PASS" : "FAIL/INCONCLUSIVE")
+              << ": opposite transfers completed without deadlock; "
+              << "blocking and both commits verified\n";
+
     return ok;
 }
-} // namespace
-
-bool ledgercoreTestAfterDebit() { return !workerGate || workerGate->arrive(); }
+}
+bool ledgercoreTestAfterAccountLocks() { return !workerGate || workerGate->arrive(); }
 
 void ledgercoreTestSqlError(PGresult* result) {
     if (firstSqlState.empty()) {
@@ -296,12 +382,14 @@ int main() {
             "AND tgname='trg_journal_entries_balanced' AND tgdeferrable AND tginitdeferred "
             "AND tgenabled IN ('O','A'))") != "t")
             throw std::runtime_error("Expected enabled deferred balancing trigger is missing");
-        std::cout << "Phase 5 baseline experiments; isolation=READ COMMITTED. No retry or lock-order fix.\n";
+            std::cout << "Phase 5 ordered-lock experiments; "
+                      << "isolation=READ COMMITTED. "
+                      << "No retry policy tested.\n";
         const bool first = competing(observer.get());
         const bool second = opposing(observer.get());
         std::cout << "\nSUMMARY: experiment 1=" << (first ? "PASS" : "FAIL/INCONCLUSIVE")
-                  << "; experiment 2=" << (second ? "DEADLOCK REPRODUCED, ROLLBACK VERIFIED" : "FAIL/INCONCLUSIVE")
-                  << "\nThis diagnoses the baseline. It does NOT certify deadlock-free concurrency.\n";
+                  << "; experiment 2=" << (second ? "ORDERED LOCKING VERIFIED" : "FAIL/INCONCLUSIVE")
+                  << "\nOrdered locking is being evaluated under the two tested concurrency scenarios.\n";
         return first && second ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "PHASE 5 STOPPED: " << e.what() << '\n';

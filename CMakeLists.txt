@@ -24,8 +24,8 @@ target_link_libraries(ledgercore
     PostgreSQL::PostgreSQL
 )
 
-# Explicit experiment target: uses the same transfer implementation, with
-# test-only synchronization after the debit. No locking/retry fix is applied.
+# Explicit experiment target: uses the shared transfer implementation,
+# with test-only synchronization after ordered account locks.
 find_package(Threads REQUIRED)
 add_executable(ledgercore_concurrency EXCLUDE_FROM_ALL
     tests/validate_phase5.cpp
