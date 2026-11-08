@@ -14,6 +14,12 @@ set(PostgreSQL_INCLUDE_DIR "C:/Program Files/PostgreSQL/18/include")
 set(PostgreSQL_LIBRARY "C:/Program Files/PostgreSQL/18/lib/libpq.lib")
 
 find_package(PostgreSQL REQUIRED)
+# Optional REST API build
+option(LEDGERCORE_BUILD_API "Build LedgerCore REST API" OFF)
+
+if(LEDGERCORE_BUILD_API)
+    find_package(Drogon CONFIG REQUIRED)
+endif()
 
 add_executable(ledgercore
     src/main.cpp
@@ -37,3 +43,16 @@ target_compile_definitions(ledgercore_concurrency PRIVATE
 target_link_libraries(ledgercore_concurrency PRIVATE
     PostgreSQL::PostgreSQL Threads::Threads
 )
+# LedgerCore REST API
+if(LEDGERCORE_BUILD_API)
+
+    add_executable(ledgercore_api
+        src/api.cpp
+    )
+
+    target_link_libraries(ledgercore_api
+        PRIVATE
+        Drogon::Drogon
+    )
+
+endif()
